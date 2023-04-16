@@ -39,7 +39,8 @@ import (
 	//	"bytes" //un-comment for helpers like bytes.equal
 	"encoding/binary"
 	"errors"
-	//	"fmt" //un-comment if you want to do any debug printing.
+	"fmt"
+	//un-comment if you want to do any debug printing.
 )
 
 // Labels for key derivation
@@ -69,15 +70,17 @@ type Chatter struct {
 // You should not need to modify this, though you can add additional fields
 // if you want to.
 type Session struct {
-	MyDHRatchet       *KeyPair
-	PartnerDHRatchet  *PublicKey
-	RootChain         *SymmetricKey
-	SendChain         *SymmetricKey
-	ReceiveChain      *SymmetricKey
-	CachedReceiveKeys map[int]*SymmetricKey
-	SendCounter       int
-	LastUpdate        int
-	ReceiveCounter    int
+	MyDHRatchet        *KeyPair
+	PartnerDHRatchet   *PublicKey
+	RootChain          *SymmetricKey
+	SendChain          *SymmetricKey
+	ReceiveChain       *SymmetricKey
+	CachedReceiveKeys  map[int]*SymmetricKey
+	SendCounter        int
+	LastUpdate         int
+	ReceiveCounter     int
+	prevReceiveCounter int
+	initiator          bool
 }
 
 // Message represents a message as sent over an untrusted network.
@@ -149,14 +152,25 @@ func (c *Chatter) InitiateHandshake(partnerIdentity *PublicKey) (*PublicKey, err
 		return nil, errors.New("Already have session open")
 	}
 
+	// Generate a new DH key pair for the ratchet
+	myDHRatchet := GenerateKeyPair()
+
 	c.Sessions[*partnerIdentity] = &Session{
-		CachedReceiveKeys: make(map[int]*SymmetricKey),
-		// TODO: your code here
+		MyDHRatchet:        myDHRatchet,
+		PartnerDHRatchet:   nil,
+		RootChain:          nil,
+		SendChain:          nil,
+		ReceiveChain:       nil,
+		CachedReceiveKeys:  make(map[int]*SymmetricKey),
+		SendCounter:        0,
+		LastUpdate:         0,
+		ReceiveCounter:     0,
+		prevReceiveCounter: 0,
+		initiator:          true,
 	}
 
-	// TODO: your code here
+	return &myDHRatchet.PublicKey, nil
 
-	return nil, errors.New("Not implemented")
 }
 
 // ReturnHandshake prepares the second message sent in a handshake, containing
@@ -168,14 +182,35 @@ func (c *Chatter) ReturnHandshake(partnerIdentity,
 		return nil, nil, errors.New("Already have session open")
 	}
 
+	// Generate a new DH key pair for the ratchet
+	myDHRatchet := GenerateKeyPair()
+
+	// Generate the shared secret
+	sharedSecret_Ab := DHCombine(partnerIdentity, &myDHRatchet.PrivateKey)
+	sharedSecret_aB := DHCombine(partnerEphemeral, &c.Identity.PrivateKey)
+	sharedSecret_ab := DHCombine(partnerEphemeral, &myDHRatchet.PrivateKey)
+
+	// Combine the shared secrets
+	sharedSecret := CombineKeys(sharedSecret_Ab, sharedSecret_aB, sharedSecret_ab)
+
+	// Derive the check key
+	checkKey := sharedSecret.DeriveKey(HANDSHAKE_CHECK_LABEL)
+
 	c.Sessions[*partnerIdentity] = &Session{
-		CachedReceiveKeys: make(map[int]*SymmetricKey),
-		// TODO: your code here
+		MyDHRatchet:        myDHRatchet,
+		PartnerDHRatchet:   partnerEphemeral,
+		RootChain:          sharedSecret,
+		SendChain:          nil,
+		ReceiveChain:       nil,
+		CachedReceiveKeys:  make(map[int]*SymmetricKey),
+		SendCounter:        0,
+		LastUpdate:         0,
+		ReceiveCounter:     0,
+		prevReceiveCounter: 0,
+		initiator:          false,
 	}
 
-	// TODO: your code here
-
-	return nil, nil, errors.New("Not implemented")
+	return &myDHRatchet.PublicKey, checkKey, nil
 }
 
 // FinalizeHandshake lets the initiator receive the responder's ephemeral key
@@ -187,9 +222,23 @@ func (c *Chatter) FinalizeHandshake(partnerIdentity,
 		return nil, errors.New("Can't finalize session, not yet open")
 	}
 
-	// TODO: your code here
+	// Generate the shared secret
+	sharedSecret_Ab := DHCombine(partnerEphemeral, &c.Identity.PrivateKey)
+	sharedSecret_aB := DHCombine(partnerIdentity, &c.Sessions[*partnerIdentity].MyDHRatchet.PrivateKey)
+	sharedSecret_ab := DHCombine(partnerEphemeral, &c.Sessions[*partnerIdentity].MyDHRatchet.PrivateKey)
 
-	return nil, errors.New("Not implemented")
+	// Combine the shared secrets
+	sharedSecret := CombineKeys(sharedSecret_Ab, sharedSecret_aB, sharedSecret_ab)
+
+	// Update the root chain to shared secret
+	c.Sessions[*partnerIdentity].RootChain = sharedSecret
+	c.Sessions[*partnerIdentity].PartnerDHRatchet = partnerEphemeral
+
+	// Derive the check key
+	checkKey := sharedSecret.DeriveKey(HANDSHAKE_CHECK_LABEL)
+
+	return checkKey, nil
+
 }
 
 // SendMessage is used to send the given plaintext string as a message.
@@ -201,27 +250,126 @@ func (c *Chatter) SendMessage(partnerIdentity *PublicKey,
 		return nil, errors.New("Can't send message to partner with no open session")
 	}
 
-	message := &Message{
-		Sender:   &c.Identity.PublicKey,
-		Receiver: partnerIdentity,
-		// TODO: your code here
+	fmt.Println("initiator: ", c.Sessions[*partnerIdentity].initiator)
+
+	if c.Sessions[*partnerIdentity].SendCounter == 0 && c.Sessions[*partnerIdentity].initiator == true {
+		// for the very first msg & anyone can send the first msg
+		// if the first msg is sent by the initiator, then she doesn't have to ratchet the root chain
+		c.Sessions[*partnerIdentity].SendChain = c.Sessions[*partnerIdentity].RootChain.DeriveKey(CHAIN_LABEL)
+		c.Sessions[*partnerIdentity].RootChain = c.Sessions[*partnerIdentity].RootChain.DeriveKey(ROOT_LABEL)
+
+		// update the last update which is the message counter when root chain was last updated
+		c.Sessions[*partnerIdentity].LastUpdate++
+		fmt.Println("Initiator sends the first msg")
+
+	} else if c.Sessions[*partnerIdentity].SendCounter == 0 && c.Sessions[*partnerIdentity].initiator == false {
+		// but if Bob sends the first msg, then he has to ratchet the root chain first
+		newKeyPair := GenerateKeyPair()
+		c.Sessions[*partnerIdentity].MyDHRatchet = newKeyPair
+		newDHValue := DHCombine(c.Sessions[*partnerIdentity].PartnerDHRatchet, &newKeyPair.PrivateKey)
+
+		c.Sessions[*partnerIdentity].RootChain = CombineKeys(c.Sessions[*partnerIdentity].RootChain, newDHValue)
+		c.Sessions[*partnerIdentity].SendChain = c.Sessions[*partnerIdentity].RootChain.DeriveKey(CHAIN_LABEL)
+		c.Sessions[*partnerIdentity].RootChain = c.Sessions[*partnerIdentity].RootChain.DeriveKey(ROOT_LABEL)
+
+		// update the last update which is the message counter when root chain was last updated
+		c.Sessions[*partnerIdentity].LastUpdate++
+		fmt.Println("Responder sends the first msg")
+
+	} else if c.Sessions[*partnerIdentity].ReceiveCounter == c.Sessions[*partnerIdentity].prevReceiveCounter {
+		// in case of multiple msg in a row
+		// if prev receive counter is equal to current receive counter, then he didn't get a response back aka keep the root chain
+		c.Sessions[*partnerIdentity].SendChain = c.Sessions[*partnerIdentity].SendChain.DeriveKey(CHAIN_LABEL)
+		c.Sessions[*partnerIdentity].RootChain = c.Sessions[*partnerIdentity].RootChain.DeriveKey(ROOT_LABEL)
+
+	} else {
+		// create a new root key for a new row of messages
+		newKeyPair := GenerateKeyPair()
+		c.Sessions[*partnerIdentity].MyDHRatchet = newKeyPair
+		newDHValue := DHCombine(c.Sessions[*partnerIdentity].PartnerDHRatchet, &newKeyPair.PrivateKey)
+
+		c.Sessions[*partnerIdentity].RootChain = CombineKeys(c.Sessions[*partnerIdentity].RootChain, newDHValue)
+		c.Sessions[*partnerIdentity].SendChain = c.Sessions[*partnerIdentity].RootChain.DeriveKey(CHAIN_LABEL)
+		c.Sessions[*partnerIdentity].RootChain = c.Sessions[*partnerIdentity].RootChain.DeriveKey(ROOT_LABEL)
+
+		// update the last update which is the message counter when root chain was last updated
+		c.Sessions[*partnerIdentity].LastUpdate++
 	}
 
-	// TODO: your code here
+	// Increment the send counter.
+	c.Sessions[*partnerIdentity].SendCounter++
 
-	return message, errors.New("Not implemented")
+	IV := NewIV()
+	msgKey := c.Sessions[*partnerIdentity].SendChain.DeriveKey(KEY_LABEL)
+
+	message := &Message{
+		Sender:        &c.Identity.PublicKey,
+		Receiver:      partnerIdentity,
+		NextDHRatchet: &c.Sessions[*partnerIdentity].MyDHRatchet.PublicKey,
+		// &c.Sessions[*partnerIdentity].MyDHRatchet.PublicKey,
+		// &newKeyPair.PublicKey,
+		Counter:    c.Sessions[*partnerIdentity].SendCounter,
+		LastUpdate: c.Sessions[*partnerIdentity].LastUpdate,
+		IV:         IV,
+	}
+
+	Ciphertext := msgKey.AuthenticatedEncrypt(plaintext, message.EncodeAdditionalData(), IV)
+	message.Ciphertext = Ciphertext
+
+	// match previous receive counter to current receive counter
+	c.Sessions[*partnerIdentity].prevReceiveCounter = c.Sessions[*partnerIdentity].ReceiveCounter
+
+	fmt.Println("Send:  ", plaintext, Ciphertext)
+
+	return message, nil
 }
 
 // ReceiveMessage is used to receive the given message and return the correct
-// plaintext. This method is where most of the key derivation, ratcheting
-// and out-of-order message handling logic happens.
+// plaintext. You'll need to implement the code to ratchet, derive keys and decrypt this message.
 func (c *Chatter) ReceiveMessage(message *Message) (string, error) {
 
 	if _, exists := c.Sessions[*message.Sender]; !exists {
 		return "", errors.New("Can't receive message from partner with no open session")
 	}
 
-	// TODO: your code here
+	// Increment the receive counter.
+	c.Sessions[*message.Sender].ReceiveCounter++
 
-	return "", errors.New("Not implemented")
+	//&& message.Counter == c.Sessions[*message.Sender].ReceiveCounter
+	if c.Sessions[*message.Sender].ReceiveCounter == 0 && c.Sessions[*message.Sender].SendCounter == 0 {
+		// first in-order message to receive
+		c.Sessions[*message.Sender].ReceiveChain = c.Sessions[*message.Sender].RootChain.DeriveKey(CHAIN_LABEL)
+		c.Sessions[*message.Sender].RootChain = c.Sessions[*message.Sender].RootChain.DeriveKey(ROOT_LABEL)
+
+	} else if *message.NextDHRatchet == *c.Sessions[*message.Sender].PartnerDHRatchet {
+		// if nextDHRatchet is equal to partnerDHRatchet, then Sender didn't change the root key so I dont have to either
+		c.Sessions[*message.Sender].ReceiveChain = c.Sessions[*message.Sender].ReceiveChain.DeriveKey(CHAIN_LABEL)
+		c.Sessions[*message.Sender].RootChain = c.Sessions[*message.Sender].RootChain.DeriveKey(ROOT_LABEL)
+
+	} else {
+		newDHValue := DHCombine(message.NextDHRatchet, &c.Sessions[*message.Sender].MyDHRatchet.PrivateKey)
+		c.Sessions[*message.Sender].RootChain = CombineKeys(c.Sessions[*message.Sender].RootChain, newDHValue)
+		c.Sessions[*message.Sender].ReceiveChain = c.Sessions[*message.Sender].RootChain.DeriveKey(CHAIN_LABEL)
+		c.Sessions[*message.Sender].RootChain = c.Sessions[*message.Sender].RootChain.DeriveKey(ROOT_LABEL)
+
+	}
+
+	// decrypt the message
+	msgKey := c.Sessions[*message.Sender].ReceiveChain.DeriveKey(KEY_LABEL)
+	plaintext, err := msgKey.AuthenticatedDecrypt(message.Ciphertext, message.EncodeAdditionalData(), message.IV)
+	if err != nil {
+		fmt.Println("the error is: ", err)
+		return "", err
+	}
+
+	//update the partnerDHRatchet to the nextDHRatchet
+	c.Sessions[*message.Sender].PartnerDHRatchet = message.NextDHRatchet
+
+	// zeroize the private key
+	//c.Sessions[*message.Sender].MyDHRatchet.PrivateKey.Zeroize()
+
+	fmt.Println("Receive:", plaintext, message.Ciphertext)
+
+	return plaintext, nil
+
 }
