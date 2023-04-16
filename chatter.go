@@ -335,11 +335,28 @@ func (c *Chatter) ReceiveMessage(message *Message) (string, error) {
 	// Increment the receive counter.
 	c.Sessions[*message.Sender].ReceiveCounter++
 
-	//&& message.Counter == c.Sessions[*message.Sender].ReceiveCounter
-	if c.Sessions[*message.Sender].ReceiveCounter == 0 && c.Sessions[*message.Sender].SendCounter == 0 {
+	if c.Sessions[*message.Sender].ReceiveCounter == 0 && c.Sessions[*message.Sender].SendCounter == 0 && message.Counter == c.Sessions[*message.Sender].ReceiveCounter {
 		// first in-order message to receive
 		c.Sessions[*message.Sender].ReceiveChain = c.Sessions[*message.Sender].RootChain.DeriveKey(CHAIN_LABEL)
 		c.Sessions[*message.Sender].RootChain = c.Sessions[*message.Sender].RootChain.DeriveKey(ROOT_LABEL)
+
+	} else if message.Counter > c.Sessions[*message.Sender].ReceiveCounter {
+		// handle early messages
+		numOfMissingMsg := message.Counter - c.Sessions[*message.Sender].ReceiveCounter
+
+		for i := c.Sessions[*message.Sender].ReceiveCounter - 1; i == int(numOfMissingMsg); i++ {
+
+			if i == c.Sessions[*message.Sender].LastUpdate {
+				newDHValue := DHCombine(message.NextDHRatchet, &c.Sessions[*message.Sender].MyDHRatchet.PrivateKey)
+				c.Sessions[*message.Sender].RootChain = CombineKeys(c.Sessions[*message.Sender].RootChain, newDHValue)
+			}
+
+			c.Sessions[*message.Sender].ReceiveChain = c.Sessions[*message.Sender].RootChain.DeriveKey(CHAIN_LABEL)
+			c.Sessions[*message.Sender].RootChain = c.Sessions[*message.Sender].RootChain.DeriveKey(ROOT_LABEL)
+
+			c.Sessions[*message.Sender].CachedReceiveKeys[i] = c.Sessions[*message.Sender].ReceiveChain
+
+		}
 
 	} else if *message.NextDHRatchet == *c.Sessions[*message.Sender].PartnerDHRatchet {
 		// if nextDHRatchet is equal to partnerDHRatchet, then Sender didn't change the root key so I dont have to either
