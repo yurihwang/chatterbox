@@ -39,7 +39,6 @@ import (
 	//	"bytes" //un-comment for helpers like bytes.equal
 	"encoding/binary"
 	"errors"
-	"fmt"
 	//un-comment if you want to do any debug printing.
 )
 
@@ -163,7 +162,7 @@ func (c *Chatter) InitiateHandshake(partnerIdentity *PublicKey) (*PublicKey, err
 		ReceiveChain:       nil,
 		CachedReceiveKeys:  make(map[int]*SymmetricKey),
 		SendCounter:        0,
-		LastUpdate:         0,
+		LastUpdate:         -1,
 		ReceiveCounter:     0,
 		prevReceiveCounter: 0,
 		initiator:          true,
@@ -241,6 +240,22 @@ func (c *Chatter) FinalizeHandshake(partnerIdentity,
 
 }
 
+func (c *Chatter) CreateNewChain(partnerIdentity *PublicKey) *SymmetricKey {
+
+	// generate new DH key pair and create new root chain
+	c.Sessions[*partnerIdentity].MyDHRatchet = GenerateKeyPair()
+	newDHValue := DHCombine(c.Sessions[*partnerIdentity].PartnerDHRatchet, &c.Sessions[*partnerIdentity].MyDHRatchet.PrivateKey)
+	c.Sessions[*partnerIdentity].RootChain = CombineKeys(c.Sessions[*partnerIdentity].RootChain.DeriveKey(ROOT_LABEL), newDHValue)
+
+	// create new send chain
+	NewSendChain := c.Sessions[*partnerIdentity].RootChain.DeriveKey(CHAIN_LABEL)
+
+	// create an input for next root key
+	c.Sessions[*partnerIdentity].RootChain = c.Sessions[*partnerIdentity].RootChain.DeriveKey(ROOT_LABEL)
+
+	return NewSendChain
+}
+
 // SendMessage is used to send the given plaintext string as a message.
 // You'll need to implement the code to ratchet, derive keys and encrypt this message.
 func (c *Chatter) SendMessage(partnerIdentity *PublicKey,
@@ -250,142 +265,180 @@ func (c *Chatter) SendMessage(partnerIdentity *PublicKey,
 		return nil, errors.New("Can't send message to partner with no open session")
 	}
 
-	fmt.Println("initiator: ", c.Sessions[*partnerIdentity].initiator)
-
-	if c.Sessions[*partnerIdentity].SendCounter == 0 && c.Sessions[*partnerIdentity].initiator == true {
-		// for the very first msg & anyone can send the first msg
-		// if the first msg is sent by the initiator, then she doesn't have to ratchet the root chain
-		c.Sessions[*partnerIdentity].SendChain = c.Sessions[*partnerIdentity].RootChain.DeriveKey(CHAIN_LABEL)
-		c.Sessions[*partnerIdentity].RootChain = c.Sessions[*partnerIdentity].RootChain.DeriveKey(ROOT_LABEL)
-
-		// update the last update which is the message counter when root chain was last updated
-		c.Sessions[*partnerIdentity].LastUpdate++
-		fmt.Println("Initiator sends the first msg")
-
-	} else if c.Sessions[*partnerIdentity].SendCounter == 0 && c.Sessions[*partnerIdentity].initiator == false {
-		// but if Bob sends the first msg, then he has to ratchet the root chain first
-		newKeyPair := GenerateKeyPair()
-		c.Sessions[*partnerIdentity].MyDHRatchet = newKeyPair
-		newDHValue := DHCombine(c.Sessions[*partnerIdentity].PartnerDHRatchet, &newKeyPair.PrivateKey)
-
-		c.Sessions[*partnerIdentity].RootChain = CombineKeys(c.Sessions[*partnerIdentity].RootChain, newDHValue)
-		c.Sessions[*partnerIdentity].SendChain = c.Sessions[*partnerIdentity].RootChain.DeriveKey(CHAIN_LABEL)
-		c.Sessions[*partnerIdentity].RootChain = c.Sessions[*partnerIdentity].RootChain.DeriveKey(ROOT_LABEL)
-
-		// update the last update which is the message counter when root chain was last updated
-		c.Sessions[*partnerIdentity].LastUpdate++
-		fmt.Println("Responder sends the first msg")
-
-	} else if c.Sessions[*partnerIdentity].ReceiveCounter == c.Sessions[*partnerIdentity].prevReceiveCounter {
-		// in case of multiple msg in a row
-		// if prev receive counter is equal to current receive counter, then he didn't get a response back aka keep the root chain
-		c.Sessions[*partnerIdentity].SendChain = c.Sessions[*partnerIdentity].SendChain.DeriveKey(CHAIN_LABEL)
-		c.Sessions[*partnerIdentity].RootChain = c.Sessions[*partnerIdentity].RootChain.DeriveKey(ROOT_LABEL)
-
-	} else {
-		// create a new root key for a new row of messages
-		newKeyPair := GenerateKeyPair()
-		c.Sessions[*partnerIdentity].MyDHRatchet = newKeyPair
-		newDHValue := DHCombine(c.Sessions[*partnerIdentity].PartnerDHRatchet, &newKeyPair.PrivateKey)
-
-		c.Sessions[*partnerIdentity].RootChain = CombineKeys(c.Sessions[*partnerIdentity].RootChain, newDHValue)
-		c.Sessions[*partnerIdentity].SendChain = c.Sessions[*partnerIdentity].RootChain.DeriveKey(CHAIN_LABEL)
-		c.Sessions[*partnerIdentity].RootChain = c.Sessions[*partnerIdentity].RootChain.DeriveKey(ROOT_LABEL)
-
-		// update the last update which is the message counter when root chain was last updated
-		c.Sessions[*partnerIdentity].LastUpdate++
-	}
-
-	// Increment the send counter.
 	c.Sessions[*partnerIdentity].SendCounter++
 
+	var NewSendChain *SymmetricKey
+	if c.Sessions[*partnerIdentity].LastUpdate == -1 {
+
+		// Case for Alice's first message: She uses the initial root chain
+		NewSendChain = c.Sessions[*partnerIdentity].RootChain.DeriveKey(CHAIN_LABEL)
+		c.Sessions[*partnerIdentity].RootChain = c.Sessions[*partnerIdentity].RootChain.DeriveKey(ROOT_LABEL)
+		c.Sessions[*partnerIdentity].LastUpdate = c.Sessions[*partnerIdentity].SendCounter
+
+	} else if c.Sessions[*partnerIdentity].LastUpdate == 0 {
+
+		// Case for Bob's first message: Bob creates a new root chain even if he sends the very first message
+		NewSendChain = c.CreateNewChain(partnerIdentity)
+		c.Sessions[*partnerIdentity].LastUpdate = c.Sessions[*partnerIdentity].SendCounter
+
+	} else if c.Sessions[*partnerIdentity].prevReceiveCounter == c.Sessions[*partnerIdentity].ReceiveCounter {
+
+		// Case for mulitple messages in a row: Only send chain is ratcheted
+		NewSendChain = c.Sessions[*partnerIdentity].SendChain
+
+	} else {
+
+		// Case for first messages after receiving a response: Create a new root chain
+		NewSendChain = c.CreateNewChain(partnerIdentity)
+		c.Sessions[*partnerIdentity].LastUpdate = c.Sessions[*partnerIdentity].SendCounter
+		c.Sessions[*partnerIdentity].prevReceiveCounter = c.Sessions[*partnerIdentity].ReceiveCounter
+
+	}
+
+	c.Sessions[*partnerIdentity].SendChain = NewSendChain.DeriveKey(CHAIN_LABEL)
+
+	// encrypt message
 	IV := NewIV()
-	msgKey := c.Sessions[*partnerIdentity].SendChain.DeriveKey(KEY_LABEL)
+	msgKey := NewSendChain.DeriveKey(KEY_LABEL)
 
 	message := &Message{
 		Sender:        &c.Identity.PublicKey,
 		Receiver:      partnerIdentity,
 		NextDHRatchet: &c.Sessions[*partnerIdentity].MyDHRatchet.PublicKey,
-		// &c.Sessions[*partnerIdentity].MyDHRatchet.PublicKey,
-		// &newKeyPair.PublicKey,
-		Counter:    c.Sessions[*partnerIdentity].SendCounter,
-		LastUpdate: c.Sessions[*partnerIdentity].LastUpdate,
-		IV:         IV,
+		Counter:       c.Sessions[*partnerIdentity].SendCounter,
+		LastUpdate:    c.Sessions[*partnerIdentity].LastUpdate,
+		IV:            IV,
 	}
 
 	Ciphertext := msgKey.AuthenticatedEncrypt(plaintext, message.EncodeAdditionalData(), IV)
 	message.Ciphertext = Ciphertext
 
-	// match previous receive counter to current receive counter
-	c.Sessions[*partnerIdentity].prevReceiveCounter = c.Sessions[*partnerIdentity].ReceiveCounter
-
-	fmt.Println("Send:  ", plaintext, Ciphertext)
-
 	return message, nil
+
+}
+
+func (c *Chatter) UpdateToNewChain(message *Message) *SymmetricKey {
+
+	// compute new DH value and create new root chain
+	newDHValue := DHCombine(message.NextDHRatchet, &c.Sessions[*message.Sender].MyDHRatchet.PrivateKey)
+	c.Sessions[*message.Sender].RootChain = CombineKeys(c.Sessions[*message.Sender].RootChain.DeriveKey(ROOT_LABEL), newDHValue)
+
+	// create new receive chain
+	NewReceiveChain := c.Sessions[*message.Sender].RootChain.DeriveKey(CHAIN_LABEL)
+
+	// create an input for next root key
+	c.Sessions[*message.Sender].RootChain = c.Sessions[*message.Sender].RootChain.DeriveKey(ROOT_LABEL)
+
+	c.Sessions[*message.Sender].PartnerDHRatchet = message.NextDHRatchet
+	c.Sessions[*message.Sender].MyDHRatchet.PrivateKey.Zeroize()
+
+	return NewReceiveChain
 }
 
 // ReceiveMessage is used to receive the given message and return the correct
-// plaintext. You'll need to implement the code to ratchet, derive keys and decrypt this message.
+// plaintext. This method is where most of the key derivation, ratcheting
+// and out-of-order message handling logic happens.
 func (c *Chatter) ReceiveMessage(message *Message) (string, error) {
 
 	if _, exists := c.Sessions[*message.Sender]; !exists {
 		return "", errors.New("Can't receive message from partner with no open session")
 	}
 
-	// Increment the receive counter.
-	c.Sessions[*message.Sender].ReceiveCounter++
-
-	if c.Sessions[*message.Sender].ReceiveCounter == 0 && c.Sessions[*message.Sender].SendCounter == 0 && message.Counter == c.Sessions[*message.Sender].ReceiveCounter {
-		// first in-order message to receive
-		c.Sessions[*message.Sender].ReceiveChain = c.Sessions[*message.Sender].RootChain.DeriveKey(CHAIN_LABEL)
+	var NewReceiveChain *SymmetricKey
+	if c.Sessions[*message.Sender].LastUpdate == 0 {
+		// Case: Bob received Alice's first message: Alice used the initial root chain
+		NewReceiveChain = c.Sessions[*message.Sender].RootChain.DeriveKey(CHAIN_LABEL)
 		c.Sessions[*message.Sender].RootChain = c.Sessions[*message.Sender].RootChain.DeriveKey(ROOT_LABEL)
+		c.Sessions[*message.Sender].LastUpdate = message.LastUpdate
 
-	} else if message.Counter > c.Sessions[*message.Sender].ReceiveCounter {
-		// handle early messages
-		numOfMissingMsg := message.Counter - c.Sessions[*message.Sender].ReceiveCounter
+	} else if c.Sessions[*message.Sender].LastUpdate == -1 {
+		// Case: Alice received Bob's first message: Bob had to get a new root chain regardless so Alice should update her root chain too
+		NewReceiveChain = c.UpdateToNewChain(message)
+		c.Sessions[*message.Sender].LastUpdate = message.LastUpdate
 
-		for i := c.Sessions[*message.Sender].ReceiveCounter - 1; i == int(numOfMissingMsg); i++ {
+		// } else if message.Counter > c.Sessions[*message.Sender].ReceiveCounter {
+		// 	fmt.Println("out of order message")
+		// 	// handle early messages
+		// 	for i := c.Sessions[*message.Sender].ReceiveCounter + 1; i <= int(message.Counter); i++ {
 
-			if i == c.Sessions[*message.Sender].LastUpdate {
-				newDHValue := DHCombine(message.NextDHRatchet, &c.Sessions[*message.Sender].MyDHRatchet.PrivateKey)
-				c.Sessions[*message.Sender].RootChain = CombineKeys(c.Sessions[*message.Sender].RootChain, newDHValue)
-			}
+		// 		var prevChain *SymmetricKey
+		// 		if i == message.LastUpdate {
+		// 			// Root chain is ratcheted for this message; It's either the first msg from Bob or first msg after a response
+		// 			// Exception for the first message from Alice
 
-			c.Sessions[*message.Sender].ReceiveChain = c.Sessions[*message.Sender].RootChain.DeriveKey(CHAIN_LABEL)
-			c.Sessions[*message.Sender].RootChain = c.Sessions[*message.Sender].RootChain.DeriveKey(ROOT_LABEL)
+		// 			if i == 1 && c.Sessions[*message.Sender].initiator == true {
+		// 				// Case: Last Update was for M1 and Alice is the receiver; She has to ratchet bc Bob would've ratcheted for his first message
+		// 				prevChain = c.UpdateToNewChain(message)
+		// 				c.Sessions[*message.Sender].LastUpdate = message.LastUpdate
 
-			c.Sessions[*message.Sender].CachedReceiveKeys[i] = c.Sessions[*message.Sender].ReceiveChain
+		// 			} else if i == 1 && c.Sessions[*message.Sender].initiator == false {
+		// 				// Case: Last Update was for M1 and Bob is the receiver; Alice used the initial root chain when she sent her first message
+		// 				//actually, keep the initial root and derive receive chain from that
+		// 				// derive chain_key
+		// 				prevChain = c.Sessions[*message.Sender].RootChain.DeriveKey(CHAIN_LABEL)
+		// 				c.Sessions[*message.Sender].RootChain = c.Sessions[*message.Sender].RootChain.DeriveKey(ROOT_LABEL)
 
-		}
+		// 			} else {
+		// 				// Case: Last Update was for M2 or later; This is the first of new set of messages received;
+		// 				// Regardless of who, the root chain was updated before sending so the same should be done when receving
+		// 				prevChain = c.UpdateToNewChain(message)
+		// 				c.Sessions[*message.Sender].LastUpdate = message.LastUpdate
 
-	} else if *message.NextDHRatchet == *c.Sessions[*message.Sender].PartnerDHRatchet {
-		// if nextDHRatchet is equal to partnerDHRatchet, then Sender didn't change the root key so I dont have to either
-		c.Sessions[*message.Sender].ReceiveChain = c.Sessions[*message.Sender].ReceiveChain.DeriveKey(CHAIN_LABEL)
-		c.Sessions[*message.Sender].RootChain = c.Sessions[*message.Sender].RootChain.DeriveKey(ROOT_LABEL)
+		// 			}
+
+		// 		} else {
+		// 			// Root chain was not updated for this message
+		// 			if i == 1 && c.Sessions[*message.Sender].initiator == true {
+		// 				// Case: The first message from Bob is not the one with Last Update; But Alice knows that Bob ratcheted the root chain for it
+		// 				prevChain = c.UpdateToNewChain(message)
+		// 				c.Sessions[*message.Sender].LastUpdate = message.LastUpdate
+
+		// 			} else if i == 1 && c.Sessions[*message.Sender].initiator == false {
+		// 				// Case: The first message from Alice is not the one with Last Update; And Bob knows that Alice used the initial root chain for it
+
+		// 				//Bob computes for the first msg which is not Last update aka there's new DH ratchet in the future.
+		// 				// actually, keep the initial root and derive receive chain from that
+		// 				// Bob should use receive chain from root chain if it's the first message
+		// 				prevChain = c.Sessions[*message.Sender].RootChain.DeriveKey(CHAIN_LABEL)
+		// 				c.Sessions[*message.Sender].RootChain = c.Sessions[*message.Sender].RootChain.DeriveKey(ROOT_LABEL)
+
+		// 			} else {
+		// 				// Case: The message does not have a new DH ratchet aka it's M2 or greater in a set of messages sent in a row
+		// 				c.Sessions[*message.Sender].ReceiveChain = c.Sessions[*message.Sender].ReceiveChain.DeriveKey(CHAIN_LABEL)
+
+		// 			}
+
+		// 		}
+
+		// 		c.Sessions[*message.Sender].ReceiveChain = NewReceiveChain.DeriveKey(CHAIN_LABEL)
+		// 		prevMsgKey := prevChain.DeriveKey(KEY_LABEL)
+		// 		c.Sessions[*message.Sender].CachedReceiveKeys[i] = prevMsgKey
+
+		// 	}
+
+	} else if message.NextDHRatchet == c.Sessions[*message.Sender].PartnerDHRatchet {
+
+		// Case: received multiple messages in a row: Only ratchet the receive key
+		NewReceiveChain = c.Sessions[*message.Sender].ReceiveChain
 
 	} else {
-		newDHValue := DHCombine(message.NextDHRatchet, &c.Sessions[*message.Sender].MyDHRatchet.PrivateKey)
-		c.Sessions[*message.Sender].RootChain = CombineKeys(c.Sessions[*message.Sender].RootChain, newDHValue)
-		c.Sessions[*message.Sender].ReceiveChain = c.Sessions[*message.Sender].RootChain.DeriveKey(CHAIN_LABEL)
-		c.Sessions[*message.Sender].RootChain = c.Sessions[*message.Sender].RootChain.DeriveKey(ROOT_LABEL)
+
+		// Case: reveived a new message after sending one: Get a new root chain
+		NewReceiveChain = c.UpdateToNewChain(message)
+		c.Sessions[*message.Sender].LastUpdate = message.LastUpdate
 
 	}
 
-	// decrypt the message
-	msgKey := c.Sessions[*message.Sender].ReceiveChain.DeriveKey(KEY_LABEL)
+	c.Sessions[*message.Sender].ReceiveChain = NewReceiveChain.DeriveKey(CHAIN_LABEL)
+
+	c.Sessions[*message.Sender].ReceiveCounter++ //맨 앞으로 옮기면 어떨까?
+
+	// decrypt message
+	msgKey := NewReceiveChain.DeriveKey(KEY_LABEL)
 	plaintext, err := msgKey.AuthenticatedDecrypt(message.Ciphertext, message.EncodeAdditionalData(), message.IV)
 	if err != nil {
-		fmt.Println("the error is: ", err)
 		return "", err
 	}
-
-	//update the partnerDHRatchet to the nextDHRatchet
-	c.Sessions[*message.Sender].PartnerDHRatchet = message.NextDHRatchet
-
-	// zeroize the private key
-	//c.Sessions[*message.Sender].MyDHRatchet.PrivateKey.Zeroize()
-
-	fmt.Println("Receive:", plaintext, message.Ciphertext)
 
 	return plaintext, nil
 
